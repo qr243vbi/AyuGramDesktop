@@ -402,6 +402,38 @@ void VisitRichMessage(
 		documentCallback);
 }
 
+[[nodiscard]] int32 SingleMessageId(const MTPmessages_Messages &data) {
+	return data.match([&](const MTPDmessages_messagesNotModified &data) {
+		return 0;
+	}, [&](const auto &data) {
+		const auto &list = data.vmessages().v;
+		return list.isEmpty()
+			? 0
+			: list[0].match([](const auto &data) { return data.vid().v; });
+	});
+}
+
+// Parses messages.getHistory result, requested with offset_date and limit 1.
+// Returns the count of messages sent since that offset_date, if known.
+[[nodiscard]] std::optional<int> MessagesCountSince(
+		const MTPmessages_Messages &data) {
+	return data.match([](
+			const MTPDmessages_messagesNotModified &) -> std::optional<int> {
+		return std::nullopt;
+	}, [](const MTPDmessages_messages &) -> std::optional<int> {
+		return std::nullopt;
+	}, [](const auto &data) -> std::optional<int> {
+		if (data.vmessages().v.isEmpty()) {
+			// No messages before that date, all of them are after it.
+			return data.vcount().v;
+		} else if (const auto offset = data.voffset_id_offset()) {
+			// Position of the returned message counting from the newest.
+			return offset->v;
+		}
+		return std::nullopt;
+	});
+}
+
 } // namespace
 
 class ApiWrap::LoadedFileCache {
@@ -562,6 +594,7 @@ struct ApiWrap::AbstractMessagesProcess {
 	std::optional<Data::MessagesSlice> slice;
 	std::vector<MessageFileWork> messageFileWork;
 	bool lastSlice = false;
+	bool startByDateResolved = false;
 	int hydrationIndex = 0;
 	int fileIndex = 0;
 	int messageFileWorkIndex = 0;
@@ -1797,6 +1830,7 @@ void ApiWrap::requestMessagesCount(int localSplitIndex) {
 	requestChatMessages(
 		_chatProcess->info.splits[localSplitIndex],
 		0, // offset_id
+		0, // offset_date
 		0, // add_offset
 		1, // limit
 		[=](const MTPmessages_Messages &result) {
@@ -1833,7 +1867,7 @@ void ApiWrap::checkFirstMessageDate(int localSplitIndex, int count) {
 	Expects(localSplitIndex < _chatProcess->info.splits.size());
 
 	if (_settings->singlePeerTill <= 0) {
-		messagesCountLoaded(localSplitIndex, count);
+		requestMessagesCountInRange(localSplitIndex, count);
 		return;
 	}
 
@@ -1841,6 +1875,7 @@ void ApiWrap::checkFirstMessageDate(int localSplitIndex, int count) {
 	requestChatMessages(
 		_chatProcess->info.splits[localSplitIndex],
 		1, // offset_id
+		0, // offset_date
 		-1, // add_offset
 		1, // limit
 		[=](const MTPmessages_Messages &result) {
@@ -1849,7 +1884,67 @@ void ApiWrap::checkFirstMessageDate(int localSplitIndex, int count) {
 		const auto skipSplit = !Data::SingleMessageBefore(
 			result,
 			_settings->singlePeerTill);
-		messagesCountLoaded(localSplitIndex, skipSplit ? 0 : count);
+		if (skipSplit) {
+			messagesCountLoaded(localSplitIndex, 0);
+		} else {
+			requestMessagesCountInRange(localSplitIndex, count);
+		}
+	});
+}
+
+void ApiWrap::requestMessagesCountInRange(int localSplitIndex, int count) {
+	Expects(_chatProcess != nullptr);
+	Expects(localSplitIndex < _chatProcess->info.splits.size());
+
+	const auto from = _settings->singlePeerFrom;
+	const auto till = _settings->singlePeerTill;
+	if ((from <= 0 && till <= 0) || _chatProcess->info.onlyMyMessages) {
+		// messages.search already counts only the messages in the range.
+		messagesCountLoaded(localSplitIndex, count);
+		return;
+	}
+	requestMessagesCountSince(localSplitIndex, from, count, [=](
+			std::optional<int> sinceFrom) {
+		requestMessagesCountSince(localSplitIndex, till, 0, [=](
+				std::optional<int> sinceTill) {
+			const auto inRange = (sinceFrom && sinceTill)
+				? (*sinceFrom - *sinceTill)
+				: 0;
+
+			// The count is used only for the progress display, but zero
+			// means "skip this split", so fall back to the total count.
+			const auto good = (inRange > 0 && inRange <= count);
+			messagesCountLoaded(localSplitIndex, good ? inRange : count);
+		});
+	});
+}
+
+void ApiWrap::requestMessagesCountSince(
+		int localSplitIndex,
+		TimeId date,
+		int unboundedCount,
+		Fn<void(std::optional<int>)> done) {
+	Expects(_chatProcess != nullptr);
+	Expects(localSplitIndex < _chatProcess->info.splits.size());
+
+	if (date <= 0) {
+		done(unboundedCount);
+		return;
+	}
+	requestChatMessages(
+		_chatProcess->info.splits[localSplitIndex],
+		0, // offset_id
+		date, // offset_date
+		0, // add_offset
+		1, // limit
+		[=](const MTPmessages_Messages &result) {
+		Expects(_chatProcess != nullptr);
+
+		// If we've switched to messages.search in the meantime,
+		// the result isn't what we've asked for, ignore it.
+		done(_chatProcess->info.onlyMyMessages
+			? std::nullopt
+			: MessagesCountSince(result));
 	});
 }
 
@@ -2205,9 +2300,39 @@ void ApiWrap::requestMessagesSlice() {
 		startMessagesSlice({});
 		return;
 	}
+	if (!_chatProcess->startByDateResolved
+		&& _settings->singlePeerFrom > 0
+		&& !_chatProcess->info.onlyMyMessages) {
+		// Find the last message before the requested range,
+		// so that we don't walk through the whole history before it.
+		requestChatMessages(
+			_chatProcess->info.splits[_chatProcess->localSplitIndex],
+			0, // offset_id
+			_settings->singlePeerFrom, // offset_date
+			0, // add_offset
+			1, // limit
+			[=](const MTPmessages_Messages &result) {
+			Expects(_chatProcess != nullptr);
+
+			_chatProcess->startByDateResolved = true;
+			if (!_chatProcess->info.onlyMyMessages) {
+				// If we've switched to messages.search in the meantime,
+				// the result isn't what we've asked for, ignore it.
+				const auto id = SingleMessageId(result);
+				if (id > 0) {
+					_chatProcess->largestIdPlusOne = std::max(
+						_chatProcess->largestIdPlusOne,
+						id + 1);
+				}
+			}
+			requestMessagesSlice();
+		});
+		return;
+	}
 	requestChatMessages(
 		_chatProcess->info.splits[_chatProcess->localSplitIndex],
 		_chatProcess->largestIdPlusOne,
+		0, // offset_date
 		-kMessagesSliceLimit,
 		kMessagesSliceLimit,
 		[=](const MTPmessages_Messages &result) {
@@ -2232,6 +2357,7 @@ void ApiWrap::requestMessagesSlice() {
 void ApiWrap::requestChatMessages(
 		int splitIndex,
 		int offsetId,
+		TimeId offsetDate,
 		int addOffset,
 		int limit,
 		FnMut<void(MTPmessages_Messages&&)> done) {
@@ -2263,8 +2389,8 @@ void ApiWrap::requestChatMessages(
 			MTPVector<MTPReaction>(), // saved_reaction
 			MTPint(), // top_msg_id
 			MTP_inputMessagesFilterEmpty(),
-			MTP_int(0), // min_date
-			MTP_int(0), // max_date
+			MTP_int(std::max(_settings->singlePeerFrom - 1, 0)), // min_date
+			MTP_int(std::max(_settings->singlePeerTill, 0)), // max_date
 			MTP_int(offsetId),
 			MTP_int(addOffset),
 			MTP_int(limit),
@@ -2276,7 +2402,7 @@ void ApiWrap::requestChatMessages(
 		splitRequest(realSplitIndex, MTPmessages_GetHistory(
 			realPeerInput,
 			MTP_int(offsetId),
-			MTP_int(0), // offset_date
+			MTP_int(offsetDate),
 			MTP_int(addOffset),
 			MTP_int(limit),
 			MTP_int(0), // max_id
@@ -2295,6 +2421,7 @@ void ApiWrap::requestChatMessages(
 					requestChatMessages(
 						splitIndex,
 						offsetId,
+						offsetDate,
 						addOffset,
 						limit,
 						base::take(_chatProcess->requestDone));
@@ -2797,6 +2924,11 @@ void ApiWrap::finishMessagesSlice() {
 
 	auto slice = *base::take(_chatProcess->slice);
 	if (!slice.list.empty()) {
+		if (_settings->singlePeerTill > 0
+			&& slice.list.back().date >= _settings->singlePeerTill) {
+			// All the following messages are out of the requested range.
+			_chatProcess->lastSlice = true;
+		}
 		_chatProcess->largestIdPlusOne = slice.list.back().id + 1;
 		const auto splitIndex = _chatProcess->info.splits[
 			_chatProcess->localSplitIndex];
@@ -2811,6 +2943,7 @@ void ApiWrap::finishMessagesSlice() {
 		&& (++_chatProcess->localSplitIndex
 			< _chatProcess->info.splits.size())) {
 		_chatProcess->lastSlice = false;
+		_chatProcess->startByDateResolved = false;
 		_chatProcess->largestIdPlusOne = 1;
 	}
 	if (!_chatProcess->lastSlice) {
@@ -2960,6 +3093,7 @@ void ApiWrap::requestTopicMessages(
 		requestTopicReplies(
 			0,
 			0,
+			0,
 			kMessagesSliceLimit,
 			[=](const MTPmessages_Messages &result) {
 				Expects(_topicProcess != nullptr);
@@ -2979,28 +3113,99 @@ void ApiWrap::requestTopicMessages(
 					return;
 				}
 				_topicProcess->totalCount = count;
-				if (!_topicProcess->start(count)) {
-					return;
-				}
+				requestTopicMessagesCountInRange(count, [=](int inRange) {
+					Expects(_topicProcess != nullptr);
 
-				if (!rootSlicePtr->list.empty()) {
-					startMessagesSlice(std::move(*rootSlicePtr));
-					return;
-				}
+					if (!_topicProcess->start(inRange)) {
+						return;
+					}
 
-				requestTopicMessagesSlice();
+					if (!rootSlicePtr->list.empty()) {
+						startMessagesSlice(std::move(*rootSlicePtr));
+						return;
+					}
+
+					requestTopicMessagesSlice();
+				});
 			});
 	}).send();
+}
+
+void ApiWrap::requestTopicMessagesCountInRange(
+		int count,
+		Fn<void(int)> done) {
+	Expects(_topicProcess != nullptr);
+
+	const auto from = _settings->singlePeerFrom;
+	const auto till = _settings->singlePeerTill;
+	if (from <= 0 && till <= 0) {
+		done(count);
+		return;
+	}
+	requestTopicMessagesCountSince(from, count, [=](
+			std::optional<int> sinceFrom) {
+		requestTopicMessagesCountSince(till, 0, [=](
+				std::optional<int> sinceTill) {
+			const auto inRange = (sinceFrom && sinceTill)
+				? (*sinceFrom - *sinceTill)
+				: 0;
+
+			// The count is used only for the progress display.
+			const auto good = (inRange > 0 && inRange <= count);
+			done(good ? inRange : count);
+		});
+	});
+}
+
+void ApiWrap::requestTopicMessagesCountSince(
+		TimeId date,
+		int unboundedCount,
+		Fn<void(std::optional<int>)> done) {
+	Expects(_topicProcess != nullptr);
+
+	if (date <= 0) {
+		done(unboundedCount);
+		return;
+	}
+	requestTopicReplies(
+		0, // offset_id
+		date, // offset_date
+		0, // add_offset
+		1, // limit
+		[=](const MTPmessages_Messages &result) {
+			done(MessagesCountSince(result));
+		});
 }
 
 void ApiWrap::requestTopicMessagesSlice() {
 	Expects(_topicProcess != nullptr);
 
+	if (!_topicProcess->startByDateResolved
+		&& _settings->singlePeerFrom > 0) {
+		// Find the last reply before the requested range,
+		// so that we don't walk through the whole topic before it.
+		requestTopicReplies(
+			0, // offset_id
+			_settings->singlePeerFrom, // offset_date
+			0, // add_offset
+			1, // limit
+			[=](const MTPmessages_Messages &result) {
+				Expects(_topicProcess != nullptr);
+
+				_topicProcess->startByDateResolved = true;
+				_topicProcess->offsetId = std::max(
+					_topicProcess->offsetId,
+					SingleMessageId(result));
+				requestTopicMessagesSlice();
+			});
+		return;
+	}
 	const auto offsetId = (_topicProcess->offsetId == 0)
 		? 1
 		: (_topicProcess->offsetId + 1);
 	requestTopicReplies(
 		offsetId,
+		0, // offset_date
 		-kMessagesSliceLimit,
 		kMessagesSliceLimit,
 		[=](const MTPmessages_Messages &result) {
@@ -3028,6 +3233,7 @@ void ApiWrap::requestTopicMessagesSlice() {
 
 void ApiWrap::requestTopicReplies(
 		int offsetId,
+		TimeId offsetDate,
 		int addOffset,
 		int limit,
 		FnMut<void(MTPmessages_Messages&&)> done) {
@@ -3043,7 +3249,7 @@ void ApiWrap::requestTopicReplies(
 		_topicProcess->inputPeer,
 		MTP_int(_topicProcess->topicRootId),
 		MTP_int(offsetId),
-		MTP_int(0),
+		MTP_int(offsetDate),
 		MTP_int(addOffset),
 		MTP_int(limit),
 		MTP_int(0),
@@ -3191,6 +3397,11 @@ void ApiWrap::finishTopicMessagesSlice() {
 
 	auto slice = *base::take(_topicProcess->slice);
 	if (!slice.list.empty()) {
+		if (_settings->singlePeerTill > 0
+			&& slice.list.back().date >= _settings->singlePeerTill) {
+			// All the following replies are out of the requested range.
+			_topicProcess->lastSlice = true;
+		}
 		_topicProcess->offsetId = slice.list.back().id;
 		_topicProcess->processedCount += slice.list.size();
 		if (!_topicProcess->handleSlice(std::move(slice))) {
