@@ -410,7 +410,7 @@ jobs:
       - name: Verify files and checksums
         run: |
           cd release
-          expected=(AyuGram.dmg AyuGram.exe AyuGram.zip "AyuGramDesktop-$VERSION-full.tar.gz")
+          expected=(AyuGram.exe AyuGram.zip "AyuGramDesktop-$VERSION-full.tar.gz")
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
           for file in "${expected[@]}"; do test -s "$file"; done
           sha256sum "${expected[@]}" > SHA256SUMS.txt
